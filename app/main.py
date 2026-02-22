@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
@@ -41,6 +41,12 @@ APPLE_MUSIC_DOMAINS = ("music.apple.com", "itunes.apple.com")
 IMPERSONATE_TARGET = ""  # "" = any; or "chrome" / "safari" / "chrome:windows-10"
 
 app = FastAPI(title="Media Downloader")
+
+
+# Chrome DevTools probes this; return 204 so we don't log 404
+@app.get("/.well-known/appspecific/com.chrome.devtools.json")
+def _chrome_devtools_well_known():
+    return Response(status_code=204)
 
 
 @app.on_event("startup")
@@ -124,6 +130,17 @@ def _apply_youtube_cookies(url: str, ydl_opts: dict) -> None:
         return
     # Use Chrome cookies; if you use Firefox, change to "firefox"
     ydl_opts["cookiesfrombrowser"] = "chrome"
+
+
+# Longer timeout and retries for slow/heavy sites (e.g. PornHub, Cloudflare)
+YTDLP_SOCKET_TIMEOUT = 120
+YTDLP_RETRIES = 8
+
+
+def _apply_network_opts(ydl_opts: dict) -> None:
+    """Give slow or bot-protected sites more time and retries."""
+    ydl_opts["socket_timeout"] = YTDLP_SOCKET_TIMEOUT
+    ydl_opts["retries"] = YTDLP_RETRIES
 
 
 def _apply_cloudflare_opts(url: str, ydl_opts: dict) -> None:
@@ -374,6 +391,7 @@ def _run_download_job(job_id: str, url: str, format_spec: str) -> None:
             "buffersize": DOWNLOAD_BUFFER_SIZE,
             "http_chunk_size": HTTP_CHUNK_SIZE,
         }
+        _apply_network_opts(ydl_opts)
         _apply_cloudflare_opts(url, ydl_opts)
         _apply_youtube_cookies(url, ydl_opts)
         js = _get_js_runtimes()
@@ -512,6 +530,7 @@ def get_formats(body: UrlInput):
 
     # Apple Music and others: try yt-dlp (impersonate for Cloudflare sites e.g. youx.xxx)
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
+    _apply_network_opts(ydl_opts)
     _apply_cloudflare_opts(url, ydl_opts)
     _apply_youtube_cookies(url, ydl_opts)
     js = _get_js_runtimes()
@@ -580,6 +599,7 @@ def download_media(body: DownloadRequest):
         "buffersize": DOWNLOAD_BUFFER_SIZE,
         "http_chunk_size": HTTP_CHUNK_SIZE,
     }
+    _apply_network_opts(ydl_opts)
     _apply_cloudflare_opts(url, ydl_opts)
     _apply_youtube_cookies(url, ydl_opts)
     js = _get_js_runtimes()

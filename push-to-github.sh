@@ -11,9 +11,9 @@ fi
 
 if [ ! -d .git ]; then
   git init
+  git branch -M main
   git add .
   git commit -m "Initial commit: media-downloader"
-  git branch -M main
   git remote add origin https://github.com/spsharath1522/video-downloader.git
   echo "Repository initialized. Push with:"
   echo "  git push -u origin main"
