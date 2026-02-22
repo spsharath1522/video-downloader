@@ -303,6 +303,7 @@
   <script>
     const urlInput = document.getElementById('url');
     const fetchBtn = document.getElementById('fetchBtn');
+    const fetchMessage = document.getElementById('fetchMessage');
     const formatsCard = document.getElementById('formatsCard');
     const meta = document.getElementById('meta');
     const formatsList = document.getElementById('formatsList');
@@ -321,7 +322,7 @@
       }
 
       setLoading(fetchBtn, true);
-      downloadMessage.classList.add('hidden');
+      fetchMessage.classList.add('hidden');
       formatsCard.classList.add('hidden');
 
       try {
@@ -340,8 +341,8 @@
         formatsCard.classList.remove('hidden');
         downloadBtn.disabled = true;
       } catch (e) {
-        showMessage(downloadMessage, e.message || 'Could not fetch formats.', 'error');
-        downloadMessage.classList.remove('hidden');
+        showMessage(fetchMessage, e.message || 'Could not fetch formats.', 'error');
+        fetchMessage.classList.remove('hidden');
       } finally {
         setLoading(fetchBtn, false);
       }

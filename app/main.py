@@ -2,6 +2,7 @@
 Media Downloader API: fetch formats and download with video+audio.
 Supports YouTube, Spotify, Apple Music, and other yt-dlp sites.
 """
+import base64
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
@@ -43,9 +44,30 @@ IMPERSONATE_TARGET = ""  # "" = any; or "chrome" / "safari" / "chrome:windows-10
 app = FastAPI(title="Media Downloader")
 
 
+@app.exception_handler(RequestValidationError)
+def _validation_exception_handler(_request: Request, exc: RequestValidationError):
+    """Return 400 with a single detail message so the frontend can show it."""
+    errors = exc.errors()
+    if errors and len(errors) > 0:
+        first = errors[0]
+        msg = first.get("msg") or "Invalid request"
+        loc = first.get("loc", ())
+        if "url" in loc:
+            msg = "Please enter a valid URL (e.g. https://youtube.com/watch?v=...)."
+    else:
+        msg = "Invalid request: provide a valid URL in the request body."
+    return JSONResponse(status_code=400, content={"detail": msg})
+
+
 # Chrome DevTools probes this; return 204 so we don't log 404
 @app.get("/.well-known/appspecific/com.chrome.devtools.json")
 def _chrome_devtools_well_known():
+    return Response(status_code=204)
+
+
+@app.get("/favicon.ico")
+def _favicon():
+    """Avoid 404 when the browser requests a favicon."""
     return Response(status_code=204)
 
 
@@ -97,7 +119,7 @@ class FormatChoice(BaseModel):
 
 class DownloadRequest(BaseModel):
     url: HttpUrl
-    format_spec: str | None = None
+    format_spec: str
 
 
 def _sanitize_filename(name: str, max_length: int = 200) -> str:
@@ -118,29 +140,6 @@ def _ffmpeg_available() -> bool:
 def _aria2c_available() -> bool:
     """Return True if aria2c is installed (faster parallel downloads)."""
     return shutil.which("aria2c") is not None
-
-
-def _is_youtube_url(url: str) -> bool:
-    return "youtube.com" in url or "youtu.be" in url
-
-
-def _apply_youtube_cookies(url: str, ydl_opts: dict) -> None:
-    """Use browser cookies for YouTube to avoid 'Sign in to confirm you're not a bot'."""
-    if not _is_youtube_url(url):
-        return
-    # Use Chrome cookies; if you use Firefox, change to "firefox"
-    ydl_opts["cookiesfrombrowser"] = "chrome"
-
-
-# Longer timeout and retries for slow/heavy sites (e.g. PornHub, Cloudflare)
-YTDLP_SOCKET_TIMEOUT = 120
-YTDLP_RETRIES = 8
-
-
-def _apply_network_opts(ydl_opts: dict) -> None:
-    """Give slow or bot-protected sites more time and retries."""
-    ydl_opts["socket_timeout"] = YTDLP_SOCKET_TIMEOUT
-    ydl_opts["retries"] = YTDLP_RETRIES
 
 
 def _apply_cloudflare_opts(url: str, ydl_opts: dict) -> None:
@@ -391,9 +390,7 @@ def _run_download_job(job_id: str, url: str, format_spec: str) -> None:
             "buffersize": DOWNLOAD_BUFFER_SIZE,
             "http_chunk_size": HTTP_CHUNK_SIZE,
         }
-        _apply_network_opts(ydl_opts)
         _apply_cloudflare_opts(url, ydl_opts)
-        _apply_youtube_cookies(url, ydl_opts)
         js = _get_js_runtimes()
         if js:
             ydl_opts["js_runtimes"] = js
@@ -530,9 +527,7 @@ def get_formats(body: UrlInput):
 
     # Apple Music and others: try yt-dlp (impersonate for Cloudflare sites e.g. youx.xxx)
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
-    _apply_network_opts(ydl_opts)
     _apply_cloudflare_opts(url, ydl_opts)
-    _apply_youtube_cookies(url, ydl_opts)
     js = _get_js_runtimes()
     if js:
         ydl_opts["js_runtimes"] = js
@@ -540,7 +535,7 @@ def get_formats(body: UrlInput):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        err_msg = str(e)
+        err_msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))  # strip ANSI color codes
         if "impersonat" in err_msg.lower() and ("not available" in err_msg.lower() or "Cloudflare" in err_msg):
             raise HTTPException(
                 status_code=400,
@@ -599,9 +594,7 @@ def download_media(body: DownloadRequest):
         "buffersize": DOWNLOAD_BUFFER_SIZE,
         "http_chunk_size": HTTP_CHUNK_SIZE,
     }
-    _apply_network_opts(ydl_opts)
     _apply_cloudflare_opts(url, ydl_opts)
-    _apply_youtube_cookies(url, ydl_opts)
     js = _get_js_runtimes()
     if js:
         ydl_opts["js_runtimes"] = js
@@ -616,16 +609,25 @@ def download_media(body: DownloadRequest):
 
     path = None
     info = None
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info:
-                path = ydl.prepare_filename(info)
-    except Exception as e:
-        err = str(e)
-        if "impersonat" in err.lower() and ("not available" in err.lower() or "Cloudflare" in err):
-            err = "Cloudflare/impersonation needs curl_cffi. Run: pip install curl_cffi  then restart the app."
-        raise HTTPException(status_code=400, detail=f"Download failed: {err}")
+    last_err = None
+    for attempt in range(2):
+        try:
+            with yt_dlp.YoutubeDL(dict(ydl_opts)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    path = ydl.prepare_filename(info)
+            break
+        except Exception as e:
+            last_err = e
+            err = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+            if attempt == 0 and _is_youtube_url(url) and ("secretstorage" in err.lower() or "keyring" in err.lower()):
+                ydl_opts.pop("cookiesfrombrowser", None)
+                continue
+            if "impersonat" in err.lower() and ("not available" in err.lower() or "Cloudflare" in err):
+                raise HTTPException(status_code=400, detail="Cloudflare/impersonation needs curl_cffi. Run: pip install curl_cffi  then restart the app.")
+            raise HTTPException(status_code=400, detail=f"Download failed: {err}")
+    if last_err and info is None:
+        raise HTTPException(status_code=400, detail=f"Download failed: {re.sub(r'\x1b\[[0-9;]*m', '', str(last_err))}")
 
     if not info:
         raise HTTPException(status_code=400, detail="Download produced no file")
